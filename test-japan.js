@@ -4,8 +4,11 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 
 puppeteer.use(StealthPlugin());
 
+const CHART_URL =
+  'https://charts.spotify.com/charts/view/artist-jp-daily/latest';
+
 async function main() {
-  console.log('=== SPOTIFY JAPAN ARTISTS TEST ===');
+  console.log('=== SPOTIFY JAPAN - PRUEBA CDP ===');
 
   const browser = await puppeteer.launch({
     headless: true,
@@ -15,98 +18,167 @@ async function main() {
     ]
   });
 
+  let client;
+
   try {
     const page = await browser.newPage();
 
-    let ranking = null;
-    let solicitudes = 0;
+    client = await page.createCDPSession();
 
-    page.on('response', async (response) => {
-      const url = response.url();
+    await client.send('Network.enable');
+
+    const solicitudes = new Map();
+    const lecturas = [];
+
+    let ranking = null;
+
+    client.on('Network.responseReceived', event => {
+      const url = event.response.url;
 
       if (
-        url.includes(
+        !url.includes(
           '/auth/v0/charts/artist-jp-daily/latest'
         )
       ) {
-        solicitudes++;
+        return;
+      }
 
-        console.log('--------------------------');
-        console.log('SOLICITUD SPOTIFY DETECTADA');
-        console.log('HTTP STATUS:', response.status());
-        console.log(
-          'CONTENT TYPE:',
-          response.headers()['content-type'] || 'No disponible'
-        );
+      const requestId = event.requestId;
 
-        if (response.status() === 200) {
-          try {
-            const datos = await response.json();
+      solicitudes.set(requestId, {
+        url,
+        status: event.response.status,
+        mimeType: event.response.mimeType
+      });
 
-            console.log('JSON VALIDO: SI');
+      console.log('--------------------------');
+      console.log('RESPUESTA DETECTADA');
+      console.log('HTTP STATUS:', event.response.status);
+      console.log('MIME TYPE:', event.response.mimeType);
+    });
+
+    client.on('Network.loadingFinished', event => {
+      const info = solicitudes.get(event.requestId);
+
+      if (!info) return;
+
+      solicitudes.delete(event.requestId);
+
+      const lectura = (async () => {
+        try {
+          const resultado = await client.send(
+            'Network.getResponseBody',
+            { requestId: event.requestId }
+          );
+
+          let texto = resultado.body || '';
+
+          if (resultado.base64Encoded) {
+            texto = Buffer.from(
+              texto,
+              'base64'
+            ).toString('utf8');
+          }
+
+          console.log('--------------------------');
+          console.log('CUERPO RECIBIDO');
+          console.log('HTTP STATUS:', info.status);
+          console.log('TAMAÑO:', texto.length);
+
+          if (info.status !== 200) {
             console.log(
-              'CAMPOS:',
-              Object.keys(datos).join(', ')
+              'Respuesta no exitosa. No se mostrará el cuerpo.'
             );
+            return;
+          }
 
-            if (Array.isArray(datos.entries)) {
-              ranking = datos;
-            } else {
-              console.log(
-                'La respuesta no contiene entries'
-              );
-            }
+          let datos;
 
+          try {
+            datos = JSON.parse(texto);
           } catch (error) {
             console.log(
-              'ERROR JSON:',
+              'JSON VALIDO: NO',
               error.message
             );
+            return;
           }
+
+          console.log('JSON VALIDO: SI');
+          console.log(
+            'CAMPOS:',
+            Object.keys(datos).join(', ')
+          );
+
+          if (Array.isArray(datos.entries)) {
+            ranking = datos;
+            console.log('RANKING ENCONTRADO');
+          } else {
+            console.log(
+              'JSON recibido, pero sin entries'
+            );
+          }
+
+        } catch (error) {
+          console.log(
+            'ERROR CDP:',
+            error.message
+          );
         }
-      }
+      })();
+
+      lecturas.push(lectura);
+    });
+
+    client.on('Network.loadingFailed', event => {
+      const info = solicitudes.get(event.requestId);
+
+      if (!info) return;
+
+      console.log(
+        'SOLICITUD FALLIDA:',
+        event.errorText
+      );
+
+      solicitudes.delete(event.requestId);
     });
 
     console.log('Abriendo Spotify Charts...');
 
-    const navegacion = await page.goto(
-      'https://charts.spotify.com/charts/view/artist-jp-daily/latest',
-      {
-        waitUntil: 'networkidle2',
-        timeout: 60000
-      }
-    );
+    const navegacion = await page.goto(CHART_URL, {
+      waitUntil: 'networkidle2',
+      timeout: 60000
+    });
 
     console.log(
       'HTTP PAGINA:',
-      navegacion ? navegacion.status() : 'Sin respuesta'
+      navegacion?.status() ?? 'Sin respuesta'
     );
 
-    console.log('Esperando datos...');
+    console.log('Esperando solicitudes...');
 
-    await new Promise(
-      resolve => setTimeout(resolve, 15000)
+    await new Promise(resolve =>
+      setTimeout(resolve, 15000)
     );
 
-    console.log('--------------------------');
-    console.log('SOLICITUDES DETECTADAS:', solicitudes);
+    await Promise.allSettled(lecturas);
+
+    console.log('==========================');
 
     if (!ranking) {
       console.log('RESULTADO: NO SE OBTUVO EL RANKING');
       console.log(
-        'Puede requerir autenticacion o devolver otro formato.'
+        'Revisar los HTTP STATUS y errores CDP.'
       );
       process.exitCode = 1;
       return;
     }
 
-    console.log('RESULTADO: JSON RECIBIDO');
-
+    console.log('RESULTADO: RANKING RECIBIDO');
     console.log(
       'FECHA:',
-      ranking.displayChart?.date || 'No disponible'
+      ranking.displayChart?.date ?? 'No disponible'
     );
-
     console.log(
       'TOTAL ARTISTAS:',
       ranking.entries.length
@@ -117,28 +189,22 @@ async function main() {
     );
 
     if (xg) {
+      const datos = xg.chartEntryData;
+
       console.log('--------------------------');
       console.log('XG ENCONTRADO');
-      console.log(
-        'POSICION:',
-        xg.chartEntryData.currentRank
-      );
+      console.log('POSICION:', datos.currentRank);
       console.log(
         'POSICION ANTERIOR:',
-        xg.chartEntryData.previousRank
+        datos.previousRank
       );
-      console.log(
-        'PEAK:',
-        xg.chartEntryData.peakRank
-      );
+      console.log('PEAK:', datos.peakRank);
       console.log(
         'DIAS EN CHART:',
-        xg.chartEntryData.appearancesOnChart
+        datos.appearancesOnChart
       );
     } else {
-      console.log(
-        'XG NO APARECE EN EL RANKING'
-      );
+      console.log('XG NO APARECE EN EL RANKING');
     }
 
   } catch (error) {
@@ -146,6 +212,10 @@ async function main() {
     process.exitCode = 1;
 
   } finally {
+    if (client) {
+      await client.detach().catch(() => {});
+    }
+
     await browser.close();
     console.log('=== PRUEBA FINALIZADA ===');
   }
